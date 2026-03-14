@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+batch_output/
+
+ffmpeg/
+ffmpeg_download/
+ffmpeg-release-essentials.zip
+
+*.mp4
+*.mov
+*.wav
+*.mp3
+
+*.flp
+*.dat
