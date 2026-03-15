@@ -3,6 +3,11 @@ __pycache__/
 
 batch_output/
 
+IGClips/
+aesthetic_loops/
+music_source/
+Albums/
+
 ffmpeg/
 ffmpeg_download/
 ffmpeg-release-essentials.zip
