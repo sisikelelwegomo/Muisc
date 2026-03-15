@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 
 batch_output/
+Fibbo/
+hooks.txt
 
 IGClips/
 aesthetic_loops/
