@@ -13,3 +13,10 @@ FFmpeg must be available via one of:
 - `FFMPEG_PATH` environment variable pointing to `ffmpeg.exe`
 - `.\ffmpeg\bin\ffmpeg.exe` inside this project
 - `ffmpeg` on your system `PATH`
+
+## Streamlit App
+
+```powershell
+python -m pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
