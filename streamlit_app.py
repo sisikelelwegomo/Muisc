@@ -117,6 +117,82 @@ def list_media_files(dir_path, exts):
     return sorted(files)
 
 
+def parse_audio_timings(text):
+    timings = {}
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for ln in lines:
+        if ln.startswith("#"):
+            continue
+        parts = [p.strip() for p in ln.split(",")]
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        start_s = parts[1] if len(parts) >= 2 else ""
+        end_s = parts[2] if len(parts) >= 3 else ""
+
+        def _parse_time_seconds(v):
+            s = str(v).strip()
+            if not s:
+                raise ValueError("empty time")
+            if ":" in s:
+                segs = [p.strip() for p in s.split(":")]
+                if len(segs) == 2:
+                    mm, ss = segs
+                    return float(mm) * 60.0 + float(ss)
+                if len(segs) == 3:
+                    hh, mm, ss = segs
+                    return float(hh) * 3600.0 + float(mm) * 60.0 + float(ss)
+                raise ValueError("bad time")
+            return float(s)
+
+        def _parse_time_range(v):
+            s = str(v).strip()
+            if "-" in s:
+                a, b = [p.strip() for p in s.split("-", 1)]
+                return _parse_time_seconds(a), _parse_time_seconds(b)
+            return _parse_time_seconds(s), None
+
+        try:
+            if len(parts) == 2:
+                start, end = _parse_time_range(start_s)
+            else:
+                start = _parse_time_seconds(start_s)
+                end = _parse_time_seconds(end_s) if end_s != "" else None
+        except Exception:
+            continue
+
+        if end is not None and end <= 0:
+            end = None
+
+        key = name.strip().lower()
+        if key not in timings:
+            timings[key] = []
+        timings[key].append((start, end))
+    return timings
+
+
+def resolve_audio_timing(audio_path, timings_map, default_start, default_end, pick_index):
+    key = os.path.basename(audio_path).lower()
+    if key in timings_map:
+        ranges = timings_map[key]
+        return ranges[int(pick_index) % len(ranges)]
+
+    key_no_ext = os.path.splitext(key)[0]
+    if key_no_ext in timings_map:
+        ranges = timings_map[key_no_ext]
+        return ranges[int(pick_index) % len(ranges)]
+
+    for k, v in timings_map.items():
+        if k.endswith("/" + key) or k.endswith("\\" + key):
+            return v[int(pick_index) % len(v)]
+        if key_no_ext and (k.endswith("/" + key_no_ext) or k.endswith("\\" + key_no_ext)):
+            return v[int(pick_index) % len(v)]
+
+    start = float(default_start) if default_start is not None else None
+    end = float(default_end) if default_end is not None else None
+    return start, end
+
+
 def video_has_audio(ffprobe_exe, video_path):
     if not ffprobe_exe:
         return False
@@ -178,12 +254,17 @@ def generate_one(
     *,
     base_dir,
     video_dir,
-    audio_dir,
+    audio_dirs,
     output_dir,
     hooks_lines,
+    clip_index,
     duration_seconds,
     song_volume,
     video_volume,
+    audio_start_seconds,
+    audio_end_seconds,
+    use_snippet_duration,
+    audio_timings_map,
     wrap_chars,
     font_size,
     borderw,
@@ -200,9 +281,11 @@ def generate_one(
     if not videos:
         return False, f"No videos found in {video_dir}"
 
-    audios = list_media_files(audio_dir, (".mp3", ".wav"))
+    audios = []
+    for d in audio_dirs:
+        audios.extend(list_media_files(d, (".mp3", ".wav")))
     if not audios:
-        return False, f"No audio found in {audio_dir}"
+        return False, "No audio found in the selected audio folders"
 
     caption = random.choice(hooks_lines) if hooks_lines else "POV: The Grind Never Stops"
     caption = strip_emojis(caption)
@@ -213,12 +296,34 @@ def generate_one(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    selected_video = random.choice(videos)
-    selected_audio = random.choice(audios)
-    out_name = os.path.join(output_dir, f"clip_{random.randint(100000, 999999)}.mp4")
+    videos = sorted(videos, key=lambda p: os.path.basename(p).lower())
+    audios = sorted(audios, key=lambda p: os.path.basename(p).lower())
+    idx = int(clip_index)
+    selected_video = videos[idx % len(videos)]
+    selected_audio = audios[idx % len(audios)]
+    out_name = os.path.join(output_dir, f"clip_{idx+1:03d}.mp4")
 
     try:
         has_vid_audio = video_has_audio(ffprobe, selected_video) if include_video_audio else False
+
+        clip_duration = float(duration_seconds)
+        start, end = resolve_audio_timing(
+            selected_audio,
+            audio_timings_map or {},
+            audio_start_seconds,
+            audio_end_seconds,
+            idx,
+        )
+        input_audio_duration = clip_duration
+        if start is not None and end is not None:
+            if end <= start:
+                return False, f"Audio end time must be greater than start time for {os.path.basename(selected_audio)}"
+            available = float(end - start)
+            if use_snippet_duration:
+                clip_duration = available
+                input_audio_duration = clip_duration
+            else:
+                input_audio_duration = min(clip_duration, available)
 
         cmd = [
             ffmpeg,
@@ -231,31 +336,43 @@ def generate_one(
             "-1",
             "-i",
             selected_video,
-            "-stream_loop",
-            "-1",
-            "-i",
-            selected_audio,
-            "-t",
-            str(duration_seconds),
-            "-vf",
-            vf,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
         ]
 
+        if start is not None and end is not None:
+            cmd.extend(["-ss", str(start), "-t", str(input_audio_duration), "-i", selected_audio])
+        else:
+            cmd.extend(["-stream_loop", "-1", "-i", selected_audio])
+
+        cmd.extend(
+            [
+                "-t",
+                str(clip_duration),
+                "-vf",
+                vf,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ]
+        )
+
         if has_vid_audio:
+            sa = (
+                f"[1:a]atrim=0:{input_audio_duration},asetpts=PTS-STARTPTS,"
+                f"apad=pad_dur={clip_duration},atrim=0:{clip_duration},"
+                f"volume={float(song_volume)}[sa]"
+            )
+            va = f"[0:a]volume={float(video_volume)}[va]"
             cmd.extend(
                 [
                     "-filter_complex",
-                    f"[0:a]volume={float(video_volume)}[va];[1:a]volume={float(song_volume)}[sa];[va][sa]amix=inputs=2:duration=longest:dropout_transition=2[a]",
+                    f"{va};{sa};[va][sa]amix=inputs=2:duration=longest:dropout_transition=2,atrim=0:{clip_duration}[a]",
                     "-map",
                     "0:v",
                     "-map",
@@ -263,7 +380,12 @@ def generate_one(
                 ]
             )
         else:
-            cmd.extend(["-map", "0:v", "-map", "1:a", "-af", f"volume={float(song_volume)}"])
+            af = (
+                f"atrim=0:{input_audio_duration},asetpts=PTS-STARTPTS,"
+                f"apad=pad_dur={clip_duration},atrim=0:{clip_duration},"
+                f"volume={float(song_volume)}"
+            )
+            cmd.extend(["-map", "0:v", "-map", "1:a", "-af", af])
 
         cmd.append(out_name)
 
@@ -281,13 +403,67 @@ def generate_one(
                 pass
 
 
+if os.environ.get("MUISC_SELF_TEST") == "1":
+    candidates_v = [
+        os.path.join(BASE_DIR, "IGClips2"),
+        os.path.join(BASE_DIR, "IGClips"),
+        os.path.join(BASE_DIR, "aesthetic_loops"),
+    ]
+    candidates_a = [
+        os.path.join(BASE_DIR, "music_source2"),
+        os.path.join(BASE_DIR, "music_source"),
+    ]
+    vdir = next((p for p in candidates_v if os.path.isdir(p)), None)
+    adirs = [p for p in candidates_a if os.path.isdir(p)]
+    if not vdir or not adirs:
+        print("Self test skipped: missing media folders")
+        raise SystemExit(0)
+    if not list_media_files(vdir, (".mp4", ".mov")):
+        print("Self test skipped: no videos found")
+        raise SystemExit(0)
+    audio_ok = False
+    for d in adirs:
+        if list_media_files(d, (".mp3", ".wav")):
+            audio_ok = True
+            break
+    if not audio_ok:
+        print("Self test skipped: no audio found")
+        raise SystemExit(0)
+    ok, msg = generate_one(
+        base_dir=BASE_DIR,
+        video_dir=vdir,
+        audio_dirs=adirs,
+        output_dir=os.path.join(BASE_DIR, "Fibbo"),
+        hooks_lines=["POV: test"],
+        clip_index=0,
+        duration_seconds=5.0,
+        song_volume=1.0,
+        video_volume=0.0,
+        audio_start_seconds=0.0,
+        audio_end_seconds=2.5,
+        use_snippet_duration=True,
+        audio_timings_map={},
+        wrap_chars=22,
+        font_size=60,
+        borderw=4,
+        line_spacing=15,
+        include_video_audio=False,
+    )
+    print(msg)
+    raise SystemExit(0 if ok else 1)
+
+
 st.set_page_config(page_title="Muisc Clip Generator", layout="centered")
 st.title("Muisc Clip Generator")
 
 with st.sidebar:
     st.subheader("Folders")
     video_dir = st.text_input("Video folder", value=os.path.join(BASE_DIR, "IGClips"))
-    audio_dir = st.text_input("Audio folder", value=os.path.join(BASE_DIR, "music_source"))
+    audio_dirs_text = st.text_area(
+        "Audio folders (one per line)",
+        value=os.path.join(BASE_DIR, "music_source"),
+        height=90,
+    )
     output_dir = st.text_input("Output folder", value=os.path.join(BASE_DIR, "Fibbo"))
 
     st.subheader("Video")
@@ -298,6 +474,9 @@ with st.sidebar:
     include_video_audio = st.toggle("Mix original video audio", value=False)
     song_volume = st.slider("Song volume", min_value=0.0, max_value=2.0, value=1.0, step=0.05)
     video_volume = st.slider("Video volume", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+    audio_start_seconds = st.number_input("Audio start (seconds)", min_value=0.0, max_value=36000.0, value=0.0, step=0.5)
+    audio_end_seconds = st.number_input("Audio end (seconds, 0 = disable)", min_value=0.0, max_value=36000.0, value=0.0, step=0.5)
+    use_snippet_duration = st.toggle("Use snippet duration as clip duration", value=True)
 
     st.subheader("Captions")
     wrap_chars = st.slider("Wrap width (chars)", min_value=10, max_value=40, value=22)
@@ -317,6 +496,17 @@ if os.path.exists(default_hooks_path):
 
 hooks_text = st.text_area("One hook per line", value=default_hooks_text, height=200, placeholder="POV: The grind never stops")
 hooks_lines = [line.strip() for line in hooks_text.splitlines() if line.strip()]
+
+st.subheader("Per-song Audio Times")
+timings_text = st.text_area(
+    "CSV lines: filename,start,end  (end optional; 0 = disable)",
+    value="",
+    height=140,
+    placeholder="Fibbonacci.wav,13.5,27.9\nOtherSong.mp3,0,15.2",
+)
+audio_timings_map = parse_audio_timings(timings_text)
+
+audio_dirs = [line.strip() for line in audio_dirs_text.splitlines() if line.strip()]
 
 col1, col2 = st.columns(2)
 with col1:
@@ -345,12 +535,17 @@ if run:
         return generate_one(
             base_dir=BASE_DIR,
             video_dir=video_dir,
-            audio_dir=audio_dir,
+            audio_dirs=audio_dirs,
             output_dir=output_dir,
             hooks_lines=hooks_lines,
+            clip_index=_,
             duration_seconds=duration_seconds,
             song_volume=song_volume,
             video_volume=video_volume,
+            audio_start_seconds=(audio_start_seconds if audio_end_seconds and audio_end_seconds > 0 else None),
+            audio_end_seconds=(audio_end_seconds if audio_end_seconds and audio_end_seconds > 0 else None),
+            use_snippet_duration=use_snippet_duration,
+            audio_timings_map=audio_timings_map,
             wrap_chars=wrap_chars,
             font_size=font_size,
             borderw=borderw,

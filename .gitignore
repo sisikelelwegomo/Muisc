@@ -4,10 +4,15 @@ __pycache__/
 batch_output/
 Fibbo/
 hooks.txt
+money.txt
+audio_times.csv
+RealMadrid/
 
 IGClips/
+IGClips2/
 aesthetic_loops/
 music_source/
+music_source2/
 Albums/
 
 ffmpeg/
